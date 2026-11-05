@@ -7,3 +7,6 @@ _check.js
 # 系统文件
 Thumbs.db
 Desktop.ini
+
+# ZCode 内部文件
+.zcode/
