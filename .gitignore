@@ -1,0 +1,9 @@
+# 设计迭代原型（不纳入版本库）
+layout-top-preview*.html
+
+# 临时检查文件
+_check.js
+
+# 系统文件
+Thumbs.db
+Desktop.ini
