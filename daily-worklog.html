@@ -595,7 +595,7 @@
 
 <dialog id="confirmDialog">
   <div class="dlg-body">
-    <h3>删除确认</h3>
+    <h3 id="confirmTitle">删除确认</h3>
     <p class="sub" id="confirmMsg" style="margin-bottom:0"></p>
     <div class="dialog-actions">
       <button class="btn" id="confirmCancel" type="button" autofocus>取消</button>
@@ -743,6 +743,7 @@ const DEFAULT_SETTINGS = {
   workFilter: false, amStart: '09:00', amEnd: '12:00',
   pmStart: '13:30', pmEnd: '18:00', goalHours: 8, weekendSkip: true
 };
+let loadBroken = false;
 function load(){
   try{
     const raw = localStorage.getItem(LS_KEY);
@@ -753,7 +754,15 @@ function load(){
                  settings: Object.assign({}, DEFAULT_SETTINGS, d.settings || {}) };
       }
     }
-  }catch(e){}
+  }catch(e){
+    /* 原逻辑：解析失败静默返回空 state，随后任意 save() 会覆盖掉唯一的原始数据。
+       现在先把损坏内容另存一份再降级启动，保留手工恢复的可能。 */
+    loadBroken = true;
+    try{
+      const raw = localStorage.getItem(LS_KEY);
+      if (raw) localStorage.setItem(LS_KEY + '.broken.' + Date.now(), raw);
+    }catch(_){}
+  }
   return { theme: null, tasks: [], lastBackupAt: null, settings: Object.assign({}, DEFAULT_SETTINGS) };
 }
 let state = load();
@@ -766,6 +775,38 @@ function storageAvailable(){
   catch(e){ return false; }
 }
 if (!storageAvailable()) $('#storageBanner').hidden = false;
+if (loadBroken){
+  $('#storageBanner').textContent = '检测到本地数据无法解析，已把原始内容另存为 ' + LS_KEY + '.broken.* 副本；本次以空记录启动，请勿直接导出覆盖。';
+  $('#storageBanner').hidden = false;
+}
+
+/* ── 关闭 / 休眠后的时长保护（原逻辑 open 段用 end ?? now，关页期间会整段虚增） ──
+   每 5 秒记录一次"最后可见时刻"；重新载入时若中断超过 60 秒，把运行中的段封口到该时刻并置为暂停。
+   60 秒内的普通刷新仍保持继续计时，符合 README「刷新不会丢失或错乱」。 */
+const SEEN_KEY = LS_KEY + '.seen';
+function markSeen(){
+  try{ localStorage.setItem(SEEN_KEY, String(Date.now())); }catch(e){}
+}
+function reconcileAfterGap(){
+  let seen = 0;
+  try{ seen = Number(localStorage.getItem(SEEN_KEY)) || 0; }catch(e){ return; }
+  if (!seen || Date.now() - seen <= 60000) return;
+  const now = Date.now();
+  let changed = false;
+  state.tasks.forEach(t => {
+    if (t.status !== 'running') return;
+    const g = t.segments[t.segments.length - 1];
+    if (!g || g.end != null) return;
+    g.end = Math.max(g.start, Math.min(seen, now));
+    t.status = 'paused';
+    changed = true;
+  });
+  if (changed) save();
+}
+reconcileAfterGap();
+markSeen();
+setInterval(markSeen, 5000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') markSeen(); });
 
 const byId = id => state.tasks.find(t => t.id === id);
 const todayStr = (d = new Date()) => d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
@@ -814,22 +855,52 @@ function inWorkTime(now = new Date()){
   const m = now.getHours() * 60 + now.getMinutes();
   return workRanges().some(([a, b]) => m >= a && m < b);
 }
-function todayTotal(){
-  const td = todayStr();
-  return state.tasks.filter(t => t.date === td).reduce((a,t) => a + elapsedOf(t), 0);
+/* ───────── 按自然日归属统计（B 方案） ─────────
+   原逻辑用 t.date === 目标日 过滤后再取 elapsedOf(t) 全量，导致跨零点段、历史任务「再来一轮」
+   全部算到创建日，今日投入与日报加总对不上。现在改为逐段与当天求交。 */
+function dayRange(ds){
+  const [y, m, d] = ds.split('-').map(Number);
+  /* 用日期构造而非 +864e5，避免夏令时切换日区间变成 23/25 小时 */
+  return [new Date(y, m - 1, d).getTime(), new Date(y, m - 1, d + 1).getTime()];
 }
+/* 单个任务落在 ds 当天的有效秒数。
+   - 每段 [start, end] 先与当天求交，再过 segmentWorkMs（保留工作时段/周末过滤）
+   - manualAdjustSeconds 不对应任何时间段，维持原口径归到记录归属日 t.date，不改业务语义 */
+function taskSecondsOn(t, ds, range){
+  const [dayStart, dayEnd] = range || dayRange(ds);
+  const now = Date.now();
+  let ms = 0;
+  for (const g of t.segments){
+    const a = Math.max(g.start, dayStart);
+    const b = Math.min(g.end ?? now, dayEnd);
+    if (b > a) ms += segmentWorkMs(a, b);
+  }
+  if (t.date === ds) ms += (t.manualAdjustSeconds || 0) * 1000;
+  return Math.max(0, ms / 1000);
+}
+/* 当天各任务的投入明细，供统计 / 图表 / 日报共用，保证三处口径一致 */
+function dayRows(ds){
+  const range = dayRange(ds);
+  return state.tasks.map(t => ({ t, sec: taskSecondsOn(t, ds, range) }));
+}
+function dayTotalOf(ds){ return dayRows(ds).reduce((a, r) => a + r.sec, 0); }
+function todayTotal(){ return dayTotalOf(todayStr()); }
 
 /* ───────── 格式化 ───────── */
 function fmtClock(sec){
   sec = Math.max(0, Math.round(sec));
   return pad(Math.floor(sec/3600)) + ':' + pad(Math.floor(sec%3600/60)) + ':' + pad(sec%60);
 }
+/* 原实现先 Math.round 到整秒、再 Math.floor 到分钟，7:59:59.4 显示 7h59m、7:59:59.6 显示 8h00m，
+   0.2 秒之差就造成「合计差一分钟到 8 小时」。改为按总秒数四舍五入到分钟后拆分，边界稳定。
+   只改显示层，不触碰 elapsedOf / segments / localStorage 里的计时数据。 */
 function fmtDur(sec){
   sec = Math.max(0, Math.round(sec));
-  const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60);
+  if (sec < 60) return sec + 's';
+  const totalMin = Math.round(sec / 60);
+  const h = Math.floor(totalMin / 60), m = totalMin % 60;
   if (h > 0) return h + 'h ' + pad(m) + 'm';
-  if (m > 0) return m + 'm';
-  return sec + 's';
+  return m + 'm';
 }
 const fmtTime = ts => { const d = new Date(ts); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
 function fmtDateCN(str){ const [,m,d] = str.split('-').map(Number); return m + '月' + d + '日'; }
@@ -904,7 +975,14 @@ function deleteTask(id){
 
 /* ───────── 确认弹窗 ───────── */
 let confirmCb = null;
-function askConfirm(msg, cb){ $('#confirmMsg').textContent = msg; confirmCb = cb; $('#confirmDialog').showModal(); }
+/* 原实现标题/按钮写死「删除确认」「删除」，被覆盖导入复用时文案与动作错配 */
+function askConfirm(msg, cb, opts){
+  $('#confirmMsg').textContent = msg;
+  $('#confirmTitle').textContent = (opts && opts.title) || '删除确认';
+  $('#confirmOk').textContent = (opts && opts.okLabel) || '删除';
+  confirmCb = cb;
+  $('#confirmDialog').showModal();
+}
 function closeDlg(d){
   if (!d.open || d.classList.contains('closing')) return;
   d.classList.add('closing');
@@ -949,6 +1027,11 @@ function renderNoteRow(t, noteRow){
 /* ───────── 时长修正弹窗 ───────── */
 let adjTarget = null, adjBase = 0;
 const clampInt = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.round(Number(v) || 0)));
+/* #setGoal 的 step=0.5，原 clampInt 会 Math.round 掉小数（7.5 → 8），这里保留半小时间隔 */
+const clampHalf = (v, lo, hi) => {
+  const n = Math.round(Number(v) * 2) / 2;
+  return Math.min(hi, Math.max(lo, Number.isFinite(n) ? n : lo));
+};
 function adjTargetSeconds(){
   return clampInt($('#adjH').value, 0, 99) * 3600
        + clampInt($('#adjM').value, 0, 59) * 60
@@ -1072,10 +1155,12 @@ function buildCard(t, today){
   if (t.date !== today) meta.appendChild(el('span', 'date-chip', fmtDateCN(t.date)));
   const lastSeg = t.segments[t.segments.length-1];
   const firstStart = t.segments.length ? t.segments[0].start : t.createdAt;
+  /* 原逻辑直接取 lastSeg.start；导入/异常数据可能出现空 segments，需兜底避免 renderAll 整体中断 */
+  const lastStart = lastSeg ? lastSeg.start : t.createdAt;
   if (t.status === 'running'){
-    meta.appendChild(el('span', null, fmtTime(lastSeg.start) + ' 开始'));
+    meta.appendChild(el('span', null, fmtTime(lastStart) + ' 开始'));
   } else if (t.status === 'paused'){
-    meta.appendChild(el('span', null, fmtTime(lastSeg.start) + ' 开始'));
+    meta.appendChild(el('span', null, fmtTime(lastStart) + ' 开始'));
     meta.appendChild(el('span', 'st-warn', '已暂停'));
   } else {
     meta.appendChild(el('span', 'st-done', '已完成'));
@@ -1202,11 +1287,14 @@ function renderRunCell(){
     cell.appendChild(el('div', 'rn muted', '没有正在计时的任务 · 点下方 ▶ 继续，或添加新事项开始'));
   }
 }
-/* ── 今日事项网格（暂停 + 今日完成） ── */
+/* ── 今日事项网格（当天有活动的暂停 + 今日完成） ──
+   原逻辑 (t.status !== 'done' || t.date === today) 会把所有日期的 paused 任务都收进来，
+   11/6 的遗留项到 11/9 仍显示在今日事项。现在按 B 方案的当天投入判断，跨天遗留项归档到历史记录。 */
 function renderActive(today){
+  const todaySecs = new Map(dayRows(today).map(r => [r.t.id, r.sec]));
   const rank = t => t.status === 'paused' ? 0 : 1;
   const act = state.tasks
-    .filter(t => t.status !== 'running' && (t.status !== 'done' || t.date === today))
+    .filter(t => t.status !== 'running' && (t.date === today || (todaySecs.get(t.id) || 0) > 0))
     .sort((a,b) => rank(a) - rank(b)
       || (rank(a) === 1 ? (b.doneAt || 0) - (a.doneAt || 0) : lastAct(b) - lastAct(a)));
   $('#activeSection').hidden = act.length === 0;
@@ -1216,14 +1304,17 @@ function renderActive(today){
   act.forEach(t => list.appendChild(buildCard(t, today)));
 }
 function renderHistory(today){
-  const done = state.tasks.filter(t => t.status === 'done' && t.date !== today);
-  const dates = [...new Set(done.map(t => t.date))].sort().reverse();
+  /* 原逻辑只收 status==='done'，暂停中的跨天遗留项没有任何归宿；
+     现在把「非当天 且 今天无投入」的全部任务按归属日归档，仍可从历史卡片继续/结束。 */
+  const todaySecs = new Map(dayRows(today).map(r => [r.t.id, r.sec]));
+  const hist = state.tasks.filter(t => t.date !== today && (todaySecs.get(t.id) || 0) <= 0);
+  const dates = [...new Set(hist.map(t => t.date))].sort().reverse();
   $('#historySection').hidden = dates.length === 0;
   $('#histMeta').textContent = dates.length ? dates.length + ' 天' : '';
   const wrap = $('#historyDays');
   wrap.innerHTML = '';
   dates.forEach(ds => {
-    const items = done.filter(t => t.date === ds).sort((a,b) => (b.doneAt || 0) - (a.doneAt || 0));
+    const items = hist.filter(t => t.date === ds).sort((a,b) => (b.doneAt || 0) - (a.doneAt || 0));
     const det = el('details', 'day');
     det.open = true;
     const sum = el('summary', 'day-head');
@@ -1252,9 +1343,7 @@ function tweenCount(el, target){
   };
   el._raf = requestAnimationFrame(step);
 }
-function dayTotalOf(ds){
-  return state.tasks.filter(t => t.date === ds).reduce((a,t) => a + elapsedOf(t), 0);
-}
+/* dayTotalOf 已上移到「按自然日归属统计」，streakDays 自动采用同一口径 */
 function streakDays(){
   const d = new Date();
   if (dayTotalOf(todayStr(d)) <= 0) d.setDate(d.getDate() - 1);
@@ -1265,19 +1354,22 @@ function streakDays(){
   }
   return n;
 }
+function doneDateOf(t){ return t.doneAt ? todayStr(new Date(t.doneAt)) : t.date; }
 function renderStats(){
   const y = new Date(); y.setDate(y.getDate() - 1);
-  const dSec = Math.round(todayTotal() - dayTotalOf(todayStr(y)));
+  const td = todayStr();
+  const total = todayTotal();
+  const dSec = Math.round(total - dayTotalOf(todayStr(y)));
   const d = $('#statDelta');
-  if (dSec === 0 && todayTotal() === 0){
+  if (dSec === 0 && total === 0){
     d.hidden = true;
   } else {
     d.hidden = false;
     d.textContent = '较昨日 ' + (dSec >= 0 ? '+' : '−') + fmtDur(Math.abs(dSec));
   }
   tweenCount($('#statActive'), state.tasks.filter(t => t.status === 'running').length);
-  const td = todayStr();
-  tweenCount($('#statDone'), state.tasks.filter(t => t.status === 'done' && t.date === td).length);
+  /* 原逻辑按 t.date 判断「今日完成」，跨天任务会漏计；改按完成时刻归属 */
+  tweenCount($('#statDone'), state.tasks.filter(t => t.status === 'done' && doneDateOf(t) === td).length);
   tweenCount($('#statStreak'), streakDays());
 }
 function renderChart(){
@@ -1285,10 +1377,8 @@ function renderChart(){
   wrap.innerHTML = '';
   const days = [];
   for (let i = 6; i >= 0; i--){ const d = new Date(); d.setDate(d.getDate() - i); days.push(d); }
-  const totals = days.map(d => {
-    const ds = todayStr(d);
-    return state.tasks.filter(t => t.date === ds).reduce((a,t) => a + elapsedOf(t), 0);
-  });
+  /* 与 todayTotal / 日报共用按自然日归属口径 */
+  const totals = days.map(d => dayTotalOf(todayStr(d)));
   const max = Math.max(...totals, 1);
   days.forEach((d, i) => {
     const bar = el('i', (totals[i] ? '' : 'zero ') + (i === 6 ? 'today' : ''));
@@ -1365,9 +1455,13 @@ function tickDynamic(){
     const t = byId(n.dataset.liveId);
     if (t && t.status === 'running') n.textContent = fmtClock(elapsedOf(t));
   });
+  /* todayTotal 现在逐段与当天求交，比原来贵；每帧只算一次，避免原本的三次重复遍历 */
+  const totalSec = todayTotal();
+  /* 原逻辑进度条写死 8h、百分比文字用 settings.goalHours，同一 UI 两个口径；统一为 goalSec */
+  const goalSec = (state.settings.goalHours || 8) * 3600;
   const tot = $('#statTotal');
   {
-    const label = fmtDur(todayTotal());
+    const label = fmtDur(totalSec);
     if (tot.textContent !== label){
       tot.textContent = label;
       if (tot._init){ tot.classList.remove('pop'); void tot.offsetWidth; tot.classList.add('pop'); }
@@ -1377,13 +1471,13 @@ function tickDynamic(){
   const r = runningTask();
   document.title = r ? fmtClock(elapsedOf(r)) + ' · ' + r.name : '每日工作台';
   /* 目标进度条（宠物骑行）实时更新 */
-  const pct = Math.min(100, Math.round(todayTotal() / (8 * 3600) * 100));
+  const pct = Math.min(100, Math.round(totalSec / goalSec * 100));
   const gf = $('#goalFill'), gp = $('#goalPet');
   if (gf && gp){
     gf.style.width = pct + '%';
     gp.style.left = Math.min(96, Math.max(4, pct)) + '%';
   }
-  $('#goalPct').textContent = Math.min(999, Math.round(todayTotal() / ((state.settings.goalHours || 8) * 3600) * 100)) + '%';
+  $('#goalPct').textContent = Math.min(999, Math.round(totalSec / goalSec * 100)) + '%';
 }
 setInterval(tickDynamic, 500);
 /* 非工作时间自动暂停：每 30 秒检查一次 */
@@ -1452,24 +1546,30 @@ function exportCsv(){
 $('#exportBtn').addEventListener('click', exportCsv);
 
 /* ───────── 一键生成今日汇报 ───────── */
+/* 与 fmtDur 保持同一取整口径，避免日报里又出现 7 小时 59 分钟 */
 function fmtReport(sec){
   sec = Math.max(0, Math.round(sec));
-  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60);
+  if (sec < 60) return sec + ' 秒';
+  const totalMin = Math.round(sec / 60);
+  const h = Math.floor(totalMin / 60), m = totalMin % 60;
   if (h > 0) return h + ' 小时 ' + m + ' 分钟';
-  if (m > 0) return m + ' 分钟';
-  return sec + ' 秒';
+  return m + ' 分钟';
 }
 function buildReport(){
   const td = todayStr();
-  const done = state.tasks.filter(t => t.status === 'done' && t.date === td).sort((a,b) => (a.doneAt||0) - (b.doneAt||0));
-  const active = state.tasks.filter(t => t.status !== 'done');
+  /* 原逻辑 done 按 t.date 过滤、active 取全部未完成任务，时长都取 elapsedOf(t) 全量，
+     跨天任务会漏项且明细加总与「今日总投入」对不上。改为只列当天有投入的任务，明细与总计同源。 */
+  const rows = dayRows(td).filter(r => r.sec > 0);
+  const done = rows.filter(r => r.t.status === 'done').sort((a,b) => (a.t.doneAt||0) - (b.t.doneAt||0));
+  const active = rows.filter(r => r.t.status !== 'done');
+  const total = rows.reduce((a,r) => a + r.sec, 0);
   const L = [];
   L.push('今日工作汇报（' + fmtDateCN(td) + ' ' + weekdayOf(td) + '）');
   L.push('');
-  L.push('■ 已完成 ' + done.length + ' 件 · 合计 ' + fmtReport(done.reduce((a,t) => a + elapsedOf(t), 0)));
+  L.push('■ 已完成 ' + done.length + ' 件 · 合计 ' + fmtReport(done.reduce((a,r) => a + r.sec, 0)));
   if (done.length){
-    done.forEach((t, i) => {
-      L.push((i+1) + '. ' + t.name + '（' + fmtReport(elapsedOf(t)) + '）' + (t.note ? ' —— ' + t.note : ''));
+    done.forEach((r, i) => {
+      L.push((i+1) + '. ' + r.t.name + '（' + fmtReport(r.sec) + '）' + (r.t.note ? ' —— ' + r.t.note : ''));
     });
   } else {
     L.push('（今日暂无完成事项）');
@@ -1477,14 +1577,14 @@ function buildReport(){
   L.push('');
   L.push('■ 进行中 ' + active.length + ' 件');
   if (active.length){
-    active.forEach(t => {
-      L.push('· ' + t.name + '（' + fmtReport(elapsedOf(t)) + (t.status === 'paused' ? '，暂停中' : '，计时中') + '）' + (t.note ? ' —— ' + t.note : ''));
+    active.forEach(r => {
+      L.push('· ' + r.t.name + '（' + fmtReport(r.sec) + (r.t.status === 'paused' ? '，暂停中' : '，计时中') + '）' + (r.t.note ? ' —— ' + r.t.note : ''));
     });
   } else {
     L.push('（当前无进行中事项）');
   }
   L.push('');
-  L.push('■ 今日总投入 ' + fmtReport(todayTotal()));
+  L.push('■ 今日总投入 ' + fmtReport(total));
   return L.join('\n');
 }
 async function copyText(text){
@@ -1544,22 +1644,27 @@ $('#bkFile').addEventListener('change', async e => {
   catch(err){ toast('文件不是有效的 JSON'); return; }
   const arr = Array.isArray(obj) ? obj : (obj && Array.isArray(obj.tasks) ? obj.tasks : null);
   if (!arr){ toast('备份格式不正确'); return; }
+  /* 原逻辑把 end:null（正在计时）映射成 end=start 再被 filter 丢掉，导致 segments 为空、
+     buildCard 在 paused 分支读 lastSeg.start 抛错；且 status 一律改成 paused，已完成语义丢失。 */
+  const importNow = Date.now();
   const valid = arr.filter(t => t && t.name && Array.isArray(t.segments)).map(t => {
     const segs = (t.segments || [])
-      .map(g => ({ start: +g.start || 0, end: g.end == null ? (+g.start || 0) : +g.end }))
+      .map(g => ({ start: +g.start || 0, end: g.end == null ? importNow : +g.end }))
       .filter(g => g.end > g.start);
+    const created = Number(t.createdAt) > 0 ? +t.createdAt : importNow;
     return {
       id: String(t.id || newId()),
       name: String(t.name).slice(0, 60),
       note: String(t.note || '').slice(0, 200),
-      date: /^\d{4}-\d{2}-\d{2}$/.test(t.date) ? t.date : todayStr(),
-      status: 'paused',
+      date: /^\d{4}-\d{2}-\d{2}$/.test(t.date) ? t.date : todayStr(new Date(created)),
+      /* 运行段已按导入时刻封口，故 running 降为 paused；done 保持原状 */
+      status: t.status === 'done' ? 'done' : 'paused',
       segments: segs,
       manualAdjustSeconds: Math.round(+t.manualAdjustSeconds || 0),
-      createdAt: +t.createdAt || Date.now(),
-      doneAt: t.doneAt ? +t.doneAt : null
+      createdAt: created,
+      doneAt: t.doneAt ? +t.doneAt : (t.status === 'done' && segs.length ? segs[segs.length - 1].end : null)
     };
-  });
+  }).filter(t => t.segments.length || t.manualAdjustSeconds);
   if (!valid.length){ toast('备份中没有可导入的记录'); return; }
   offerImport(valid);
 });
@@ -1589,7 +1694,7 @@ $('#impReplace').addEventListener('click', () => {
     save(); renderAll();
     toast('已覆盖导入 ' + m + ' 条');
     pendingImport = null;
-  });
+  }, { title: '覆盖导入确认', okLabel: '覆盖导入' });
 });
 $('#impCancel').addEventListener('click', () => {
   $('#importDialog').close();
@@ -1624,7 +1729,7 @@ $('#setSave').addEventListener('click', () => {
     if (toMin(pmS) >= toMin(pmE)){ toast('下午时间不正确：开始需早于结束'); return; }
     if (toMin(amE) > toMin(pmS)){ toast('上午结束时间需早于下午开始时间'); return; }
   }
-  const goal = clampInt($('#setGoal').value, 1, 16);
+  const goal = clampHalf($('#setGoal').value, 1, 16);
   state.settings = {
     workFilter: wf, amStart: amS, amEnd: amE,
     pmStart: pmS, pmEnd: pmE, goalHours: goal,
@@ -1701,7 +1806,8 @@ initTheme();
 renderAll();
 
 /* 调试辅助（供自动化测试与控制台使用） */
-window.__wl = { get state(){ return state; }, save, renderAll, elapsedOf, buildCsv };
+window.__wl = { get state(){ return state; }, save, renderAll, elapsedOf, buildCsv,
+                dayRows, taskSecondsOn, dayTotalOf, todayTotal, buildReport, dayRange };
 </script>
 </body>
 </html>
