@@ -358,6 +358,10 @@
   .day-date{ font-weight:650 }
   .day-total{ font-family:var(--mono); font-size:12px; color:var(--text-2); transition:color .15s }
   .day .group-body{ margin-top:10px }
+  /* 历史区懒渲染：默认折叠，工具条控制展开/收起全部 */
+  .hist-bar{ display:flex; justify-content:flex-end; margin:0 0 2px }
+  .hist-bar .btn.link{ font-size:12px; padding:3px 10px; border-radius:7px }
+  .hist-bar .btn.link:hover{ background:var(--accent-soft) }
 
   /* ── 空状态 / 提示 ── */
   .empty{
@@ -744,6 +748,9 @@ const DEFAULT_SETTINGS = {
   pmStart: '13:30', pmEnd: '18:00', goalHours: 8, weekendSkip: true
 };
 let loadBroken = false;
+/* 按日汇总索引（性能用）：声明在状态层，保证任何 save() 调用之前已初始化，避免 TDZ */
+let dayIndex = null, indexDay = null, dayIndexTaskRef = null;
+function invalidateDayIndex(){ dayIndex = null; dayIndexTaskRef = null; }
 function load(){
   try{
     const raw = localStorage.getItem(LS_KEY);
@@ -751,7 +758,8 @@ function load(){
       const d = JSON.parse(raw);
       if (d && Array.isArray(d.tasks)){
         return { theme: d.theme || null, tasks: d.tasks, lastBackupAt: d.lastBackupAt || null,
-                 settings: Object.assign({}, DEFAULT_SETTINGS, d.settings || {}) };
+                 settings: Object.assign({}, DEFAULT_SETTINGS, d.settings || {}),
+                 deletedIds: Array.isArray(d.deletedIds) ? d.deletedIds.slice(-500) : [] };
       }
     }
   }catch(e){
@@ -763,12 +771,38 @@ function load(){
       if (raw) localStorage.setItem(LS_KEY + '.broken.' + Date.now(), raw);
     }catch(_){}
   }
-  return { theme: null, tasks: [], lastBackupAt: null, settings: Object.assign({}, DEFAULT_SETTINGS) };
+  return { theme: null, tasks: [], lastBackupAt: null,
+           settings: Object.assign({}, DEFAULT_SETTINGS), deletedIds: [] };
 }
 let state = load();
+/* 删除墓碑：防止多标签页合并时，另一个标签页里的旧副本把已删记录复活 */
+function tombstone(id){
+  if (!Array.isArray(state.deletedIds)) state.deletedIds = [];
+  state.deletedIds.push(id);
+  if (state.deletedIds.length > 500) state.deletedIds = state.deletedIds.slice(-500);
+}
+/* 多标签页写冲突：原实现每次全量 setItem，后写的标签页会把先写的整份覆盖。
+   现在写前先读远端，按 id 合并远端独有记录；同 id 以本地为准，settings/theme 也以本地为准。 */
 function save(){
-  try{ localStorage.setItem(LS_KEY, JSON.stringify(state)); }
-  catch(e){ $('#storageBanner').hidden = false; }
+  invalidateDayIndex();
+  try{
+    let base = null;
+    try{
+      const raw = localStorage.getItem(LS_KEY);
+      if (raw){ const d = JSON.parse(raw); if (d && Array.isArray(d.tasks)) base = d; }
+    }catch(_){ /* 远端数据损坏时不合并，直接写本地，避免清掉当前记录 */ }
+    if (base){
+      const remoteGraves = Array.isArray(base.deletedIds) ? base.deletedIds : [];
+      const graves = new Set([...(state.deletedIds || []), ...remoteGraves]);
+      state.deletedIds = Array.from(graves).slice(-500);
+      /* 远端已删除的 id，本地旧快照里若还留着要一并移除，否则写回时会复活 */
+      state.tasks = state.tasks.filter(t => !graves.has(t.id));
+      const localIds = new Set(state.tasks.map(t => t.id));
+      const remoteOnly = base.tasks.filter(t => t && t.id && !localIds.has(t.id) && !graves.has(t.id));
+      if (remoteOnly.length) state.tasks = state.tasks.concat(remoteOnly);
+    }
+    localStorage.setItem(LS_KEY, JSON.stringify(state));
+  }catch(e){ $('#storageBanner').hidden = false; }
 }
 function storageAvailable(){
   try{ localStorage.setItem('__t','1'); localStorage.removeItem('__t'); return true; }
@@ -808,6 +842,23 @@ markSeen();
 setInterval(markSeen, 5000);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') markSeen(); });
 
+/* ── 多标签页同步 ──
+   storage 事件只在「其他」标签页触发，写入方不会自触发。正在输入名称/备注或开着弹窗时
+   不立即 reload，避免打断未提交的编辑，改为在下一次 renderAll 时消费。 */
+let pendingSync = false;
+function isEditing(){
+  if (document.querySelector('.rename-input, .note-input')) return true;
+  return Array.from(document.querySelectorAll('dialog')).some(d => d.open);
+}
+addEventListener('storage', e => {
+  if (e.key !== LS_KEY || e.newValue == null) return;
+  if (isEditing()){ pendingSync = true; return; }
+  state = load();
+  invalidateDayIndex();
+  renderAll();
+  toast('已同步其他标签页的改动');
+});
+
 const byId = id => state.tasks.find(t => t.id === id);
 const todayStr = (d = new Date()) => d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
 const lastAct = t => t.segments.length ? t.segments[t.segments.length-1].start : t.createdAt;
@@ -834,12 +885,15 @@ function segmentWorkMs(start, end){
   while (cur < end && guard++ < 800){
     const d = new Date(cur);
     const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-    const dayEnd = dayStart + 864e5;
+    /* 与 dayRange() 用同一套日界构造，避免夏令时切换日 +864e5 造成 23/25 小时偏差 */
+    const dayEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1).getTime();
     const stop = Math.min(end, dayEnd);
     const wd = d.getDay();
     if (!(S.weekendSkip && (wd === 0 || wd === 6))){
       for (const [a, b] of workRanges()){
-        const s = dayStart + a * 60000, e = dayStart + b * 60000;
+        /* 用本地墙钟构造起止时刻；原用 dayStart + 分钟数*60000，DST 切换日会偏移 1 小时 */
+        const s = new Date(d.getFullYear(), d.getMonth(), d.getDate(), Math.floor(a / 60), a % 60).getTime();
+        const e = new Date(d.getFullYear(), d.getMonth(), d.getDate(), Math.floor(b / 60), b % 60).getTime();
         if (stop > s && cur < e) total += Math.min(stop, e) - Math.max(cur, s);
       }
     }
@@ -878,12 +932,79 @@ function taskSecondsOn(t, ds, range){
   if (t.date === ds) ms += (t.manualAdjustSeconds || 0) * 1000;
   return Math.max(0, ms / 1000);
 }
+/* ── 按日汇总索引（性能） ──
+   原实现 renderAll 内 renderActive / renderHistory / renderStats / renderChart(7 天) / streakDays
+   各自全量遍历一次所有任务所有段，2000 条时 renderAll 达 193ms。
+   现在一次全量扫描建立「已封口段」索引，open 段按 now 实时增量叠加；
+   索引只在 state 变更（save）或跨零点时重建，读取为 O(1) + O(open 段数)。 */
+function ensureIndexFresh(){
+  const td = todayStr();
+  if (td !== indexDay){ indexDay = td; invalidateDayIndex(); }
+}
+function indexAdd(idx, ds, id, sec){
+  if (!(sec > 0)) return;
+  let e = idx.get(ds);
+  if (!e){ e = { total: 0, perTask: new Map() }; idx.set(ds, e); }
+  e.total += sec;
+  e.perTask.set(id, (e.perTask.get(id) || 0) + sec);
+}
+/* 按自然日切开一段；与 taskSecondsOn 共用 dayRange + segmentWorkMs，保证口径一致 */
+function indexSegment(idx, id, start, end){
+  let cur = start, guard = 0;
+  while (cur < end && guard++ < 800){
+    const ds = todayStr(new Date(cur));
+    const [, dayEnd] = dayRange(ds);
+    const stop = Math.min(end, dayEnd);
+    if (stop > cur) indexAdd(idx, ds, id, segmentWorkMs(cur, stop) / 1000);
+    cur = dayEnd;
+  }
+}
+function buildDayIndex(){
+  const idx = new Map();
+  for (const t of state.tasks){
+    for (const g of t.segments){
+      if (g.end == null) continue;              // open 段交给 liveIndex 实时算
+      if (g.end > g.start) indexSegment(idx, t.id, g.start, g.end);
+    }
+    if (t.manualAdjustSeconds) indexAdd(idx, t.date, t.id, t.manualAdjustSeconds);
+  }
+  return idx;
+}
+function liveIndex(ds){
+  const now = Date.now();
+  const [dayStart, dayEnd] = dayRange(ds);
+  const perTask = new Map();
+  let total = 0;
+  for (const t of state.tasks){
+    for (const g of t.segments){
+      if (g.end != null) continue;
+      const a = Math.max(g.start, dayStart), b = Math.min(now, dayEnd);
+      if (b > a){
+        const sec = segmentWorkMs(a, b) / 1000;
+        if (sec > 0){ perTask.set(t.id, (perTask.get(t.id) || 0) + sec); total += sec; }
+      }
+    }
+  }
+  return { total, perTask };
+}
+function dayIndexFor(ds){
+  ensureIndexFresh();
+  /* 引用检测：state.tasks 被整体替换（storage 重载、覆盖导入、外部调试）时立即重建 */
+  if (!dayIndex || dayIndexTaskRef !== state.tasks){
+    dayIndex = buildDayIndex();
+    dayIndexTaskRef = state.tasks;
+  }
+  const staticPart = dayIndex.get(ds) || { total: 0, perTask: new Map() };
+  const live = liveIndex(ds);
+  return { staticPart, live, total: staticPart.total + live.total };
+}
 /* 当天各任务的投入明细，供统计 / 图表 / 日报共用，保证三处口径一致 */
 function dayRows(ds){
-  const range = dayRange(ds);
-  return state.tasks.map(t => ({ t, sec: taskSecondsOn(t, ds, range) }));
+  const { staticPart, live } = dayIndexFor(ds);
+  return state.tasks.map(t => ({ t,
+    sec: Math.max(0, (staticPart.perTask.get(t.id) || 0) + (live.perTask.get(t.id) || 0)) }));
 }
-function dayTotalOf(ds){ return dayRows(ds).reduce((a, r) => a + r.sec, 0); }
+function dayTotalOf(ds){ return dayIndexFor(ds).total; }
 function todayTotal(){ return dayTotalOf(todayStr()); }
 
 /* ───────── 格式化 ───────── */
@@ -961,6 +1082,7 @@ function finishTask(id){
   if (g && g.end == null) g.end = Date.now();
   t.status = 'done';
   t.doneAt = Date.now();
+  pendingExpandDay = t.date;
   save(); renderAll();
   toast('已完成「' + t.name + '」· 用时 ' + fmtDur(elapsedOf(t)));
 }
@@ -969,6 +1091,7 @@ function deleteTask(id){
   if (!t) return;
   askConfirm('确定删除「' + t.name + '」及其全部计时记录？此操作不可恢复。', () => {
     state.tasks = state.tasks.filter(x => x.id !== id);
+    tombstone(id);
     save(); renderAll(); toast('已删除');
   });
 }
@@ -1303,31 +1426,89 @@ function renderActive(today){
   list.innerHTML = '';
   act.forEach(t => list.appendChild(buildCard(t, today)));
 }
+/* 历史区默认折叠，卡片按需懒渲染：展开某天时才构建该天的卡片。
+   折叠态仅渲染日期表头 + 当天汇总（已用按日索引，开销极小），
+   2000 条数据下 renderAll 不再一次性创建上千张卡片，彻底消掉之前的卡顿。 */
+let expandedDays = new Set();
+let pendingExpandDay = null;
+function historyDates(today, todaySecs){
+  const secs = todaySecs || new Map(dayRows(today).map(r => [r.t.id, r.sec]));
+  const hist = state.tasks.filter(t => t.date !== today && (secs.get(t.id) || 0) <= 0);
+  return [...new Set(hist.map(t => t.date))].sort().reverse();
+}
 function renderHistory(today){
   /* 原逻辑只收 status==='done'，暂停中的跨天遗留项没有任何归宿；
      现在把「非当天 且 今天无投入」的全部任务按归属日归档，仍可从历史卡片继续/结束。 */
   const todaySecs = new Map(dayRows(today).map(r => [r.t.id, r.sec]));
-  const hist = state.tasks.filter(t => t.date !== today && (todaySecs.get(t.id) || 0) <= 0);
-  const dates = [...new Set(hist.map(t => t.date))].sort().reverse();
+  const dates = historyDates(today, todaySecs);
+  /* 清理已不存在的日期，避免 expandedDays 无限增长 */
+  if (expandedDays.size){
+    const present = new Set(dates);
+    for (const d of [...expandedDays]) if (!present.has(d)) expandedDays.delete(d);
+  }
+  /* 刚完成的事项，自动展开它归属的那一天，让用户立即看到 */
+  if (pendingExpandDay && dates.includes(pendingExpandDay)){ expandedDays.add(pendingExpandDay); pendingExpandDay = null; }
+
   $('#historySection').hidden = dates.length === 0;
   $('#histMeta').textContent = dates.length ? dates.length + ' 天' : '';
   const wrap = $('#historyDays');
   wrap.innerHTML = '';
+  if (!dates.length) return;
+
+  const bar = el('div', 'hist-bar');
+  const allBtn = el('button', 'btn link'); allBtn.type = 'button';
+  const syncBar = () => { allBtn.textContent = (expandedDays.size ? '收起全部' : '展开全部') + '（' + dates.length + ' 天）'; };
+  syncBar();
+  allBtn.addEventListener('click', () => {
+    if (expandedDays.size) expandedDays.clear();
+    else dates.forEach(d => expandedDays.add(d));
+    renderHistory(today);
+  });
+  bar.appendChild(allBtn);
+  wrap.appendChild(bar);
+
   dates.forEach(ds => {
-    const items = hist.filter(t => t.date === ds).sort((a,b) => (b.doneAt || 0) - (a.doneAt || 0));
+    const items = state.tasks
+      .filter(t => t.date === ds && (todaySecs.get(t.id) || 0) <= 0)
+      .sort((a,b) => (b.doneAt || 0) - (a.doneAt || 0));
     const det = el('details', 'day');
-    det.open = true;
+    const open = expandedDays.has(ds);
+    det.open = open;
     const sum = el('summary', 'day-head');
     sum.appendChild(el('span', 'day-date', fmtDateCN(ds) + ' · ' + weekdayOf(ds)));
     sum.appendChild(el('span', 'hline'));
-    sum.appendChild(el('span', 'day-total', items.length + ' 项 · ' + fmtDur(items.reduce((a,t) => a + elapsedOf(t), 0))));
+    /* 原用 elapsedOf(t) 全量求和，与按自然日归属的统计/日报口径不一致（跨天任务会重复计入）。
+       卡片仍显示任务全量累计，这里只汇总这一组任务落在 ds 当天的投入。 */
+    const range = dayRange(ds);
+    const daySec = items.reduce((a,t) => a + taskSecondsOn(t, ds, range), 0);
+    sum.appendChild(el('span', 'day-total', items.length + ' 项 · ' + fmtDur(daySec)));
     const ch = el('span', 'chev'); ch.innerHTML = icon('chevron', 14); sum.appendChild(ch);
     det.appendChild(sum);
     const body = el('div', 'group-body');
-    items.forEach(t => body.appendChild(buildCard(t, today)));
     det.appendChild(body);
+    if (open) items.forEach(t => body.appendChild(buildCard(t, today)));
+    det._built = open;
+    det.addEventListener('toggle', () => {
+      if (det.open && !det._built){
+        items.forEach(t => body.appendChild(buildCard(t, today)));
+        det._built = true;
+        expandedDays.add(ds);
+        syncBar();
+      }
+    });
     wrap.appendChild(det);
   });
+}
+/* 供测试 / 程序化展开单个历史日 */
+function toggleHistoryDay(ds){
+  if (expandedDays.has(ds)) expandedDays.delete(ds); else expandedDays.add(ds);
+  renderHistory(todayStr());
+}
+function expandAllHistory(on){
+  const today = todayStr();
+  expandedDays.clear();
+  if (on) historyDates(today).forEach(d => expandedDays.add(d));
+  renderHistory(today);
 }
 function tweenCount(el, target){
   const from = el._val ?? target;
@@ -1398,6 +1579,8 @@ function renderEmpty(){
   }
 }
 function renderAll(){
+  /* 上一次 storage 同步因正在编辑而推迟，这里在安全的时机补上 */
+  if (pendingSync){ pendingSync = false; state = load(); invalidateDayIndex(); }
   const before = captureRects();
   const today = todayStr();
   renderRunCell();
@@ -1451,6 +1634,19 @@ function playFlip(before){
 
 /* ───────── 实时刷新 ───────── */
 function tickDynamic(){
+  /* 心跳封口只在页面加载时执行，页面一直开着跨过零点的 running 任务不在覆盖范围。
+     这里检测到「当前段始于昨天及以前」就封口到今天 00:00 并置暂停，需要再干请手动继续。 */
+  const tdNow = todayStr();
+  const r0 = runningTask();
+  if (r0){
+    const g0 = r0.segments[r0.segments.length - 1];
+    if (g0 && g0.end == null && todayStr(new Date(g0.start)) !== tdNow){
+      g0.end = dayRange(tdNow)[0];
+      r0.status = 'paused';
+      save();
+      toast('已跨过零点，「' + r0.name + '」自动暂停；需要请手动继续');
+    }
+  }
   document.querySelectorAll('[data-live-id]').forEach(n => {
     const t = byId(n.dataset.liveId);
     if (t && t.status === 'running') n.textContent = fmtClock(elapsedOf(t));
@@ -1496,10 +1692,9 @@ if (!inWorkTime()) setTimeout(() => {
   if (r){ pauseTask(r.id); toast('当前不在工作时间内，已自动暂停'); }
 }, 600);
 
-function handleBeforeUnload(e){
-  if (runningTask()){ e.preventDefault(); e.returnValue = ''; }
-}
-addEventListener('beforeunload', handleBeforeUnload);
+/* 原实现只要有 running 就 preventDefault，普通刷新也弹浏览器确认框。
+   心跳（markSeen + reconcileAfterGap）与跨零点封口已保证关页/休眠/跨天不会虚增计时，
+   不再需要拦截；页面隐藏时 visibilitychange 会写最后一次可见时刻。 */
 
 /* ───────── 主题 ───────── */
 function applyTheme(t){
@@ -1521,15 +1716,21 @@ function csvCell(v){
   v = String(v ?? '');
   return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
 }
+/* 原 CSV 只有 HH:MM，跨天记录无法区分；统一输出完整日期时间 */
+const fmtDateTime = ts => todayStr(new Date(ts)) + ' ' + fmtTime(ts);
 function buildCsv(){
   const rows = [['日期','事项','备注','状态','累计时长','首次开始','最后结束']];
   const sorted = [...state.tasks].sort((a,b) => a.date === b.date ? a.createdAt - b.createdAt : (a.date < b.date ? -1 : 1));
   for (const t of sorted){
+    const first = t.segments.length ? t.segments[0].start : null;
+    const last = t.segments.length ? t.segments[t.segments.length - 1] : null;
+    /* 原取 doneAt，暂停中的任务没有 doneAt 就显示为空；改取最后一段的 end */
+    const endTs = last && last.end != null ? last.end : t.doneAt;
     rows.push([
       t.date, t.name, t.note || '', STATUS_CN[t.status] || t.status,
       fmtClock(elapsedOf(t)),
-      t.segments.length ? fmtTime(t.segments[0].start) : '',
-      t.doneAt ? fmtTime(t.doneAt) : ''
+      first != null ? fmtDateTime(first) : '',
+      endTs != null ? fmtDateTime(endTs) : ''
     ]);
   }
   return '\uFEFF' + rows.map(r => r.map(csvCell).join(',')).join('\r\n');
@@ -1649,7 +1850,12 @@ $('#bkFile').addEventListener('change', async e => {
   const importNow = Date.now();
   const valid = arr.filter(t => t && t.name && Array.isArray(t.segments)).map(t => {
     const segs = (t.segments || [])
-      .map(g => ({ start: +g.start || 0, end: g.end == null ? importNow : +g.end }))
+      .map(g => {
+        const s = +g.start || 0;
+        /* 运行段按导入时刻封口；若 start 在未来（系统时钟回拨、跨时区/手工数据），
+           至少保留 1ms，避免整段被下面的 filter 静默丢弃 */
+        return { start: s, end: g.end == null ? Math.max(importNow, s + 1) : +g.end };
+      })
       .filter(g => g.end > g.start);
     const created = Number(t.createdAt) > 0 ? +t.createdAt : importNow;
     return {
@@ -1672,17 +1878,20 @@ let pendingImport = null;
 function offerImport(valid){
   pendingImport = valid;
   const dup = valid.filter(t => byId(t.id)).length;
-  $('#impInfo').textContent = '备份包含 ' + valid.length + ' 条记录 · 当前 ' + state.tasks.length + ' 条 · 其中 ' + dup + ' 条与现有 ID 重复';
+  $('#impInfo').textContent = '备份包含 ' + valid.length + ' 条记录 · 当前 ' + state.tasks.length + ' 条 · 其中 '
+    + dup + ' 条与现有 ID 重复'
+    + (dup ? '（合并时保留本地版本；如需以备份为准请选「覆盖导入」）' : '');
   $('#backupDialog').close();
   $('#importDialog').showModal();
 }
 $('#impMerge').addEventListener('click', () => {
   if (!pendingImport) return;
-  let added = 0;
-  pendingImport.forEach(t => { if (!byId(t.id)){ state.tasks.push(t); added++; } });
+  let added = 0, skipped = 0;
+  pendingImport.forEach(t => { if (!byId(t.id)){ state.tasks.push(t); added++; } else skipped++; });
   save(); renderAll();
   $('#importDialog').close();
-  toast('合并完成：新增 ' + added + ' 条');
+  /* 原实现只报新增数，同 ID 冲突被静默跳过；现在明确告知保留了本地版本 */
+  toast('合并完成：新增 ' + added + ' 条' + (skipped ? '，跳过 ' + skipped + ' 条同 ID（保留本地版本）' : ''));
   pendingImport = null;
 });
 $('#impReplace').addEventListener('click', () => {
@@ -1690,7 +1899,12 @@ $('#impReplace').addEventListener('click', () => {
   const n = state.tasks.length, m = pendingImport.length;
   $('#importDialog').close();
   askConfirm('覆盖导入将删除当前全部 ' + n + ' 条记录，以备份的 ' + m + ' 条为准。确定？', () => {
+    /* 覆盖即删除：把当前 id 全部记入墓碑，避免另一标签页的旧副本把它们在合并时复活 */
+    state.tasks.forEach(t => tombstone(t.id));
     state.tasks = pendingImport;
+    /* 备份里复用了这些 id 时不能让墓碑把刚导入的记录又过滤掉 */
+    const keep = new Set(pendingImport.map(t => t.id));
+    state.deletedIds = (state.deletedIds || []).filter(id => !keep.has(id));
     save(); renderAll();
     toast('已覆盖导入 ' + m + ' 条');
     pendingImport = null;
@@ -1807,7 +2021,8 @@ renderAll();
 
 /* 调试辅助（供自动化测试与控制台使用） */
 window.__wl = { get state(){ return state; }, save, renderAll, elapsedOf, buildCsv,
-                dayRows, taskSecondsOn, dayTotalOf, todayTotal, buildReport, dayRange };
+                dayRows, taskSecondsOn, dayTotalOf, todayTotal, buildReport, dayRange,
+                toggleHistoryDay, expandAllHistory, get expandedDays(){ return expandedDays; } };
 </script>
 </body>
 </html>
