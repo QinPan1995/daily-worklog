@@ -10,3 +10,7 @@ Desktop.ini
 
 # ZCode 内部文件
 .zcode/
+
+# 演示数据与截图（本地生成，不纳入版本库）
+demo-*.html
+screenshots/

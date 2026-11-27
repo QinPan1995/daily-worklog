@@ -185,6 +185,14 @@
   .g-run .rename-input{ flex:1; min-width:0; padding:4px 10px; font-size:14px }
   .g-run .timer{ font-size:20px; color:var(--accent); text-shadow:0 0 24px var(--accent-soft) }
   .g-run .mini-row{ display:flex; gap:3px }
+  /* 专注条内编辑备注时：让备注输入框独占第二行，不影响正常单行布局 */
+  .g-run.note-editing{ flex-wrap:wrap }
+  .g-run .note-input{
+    flex:1 1 100%; order:99; width:auto; max-width:none; margin-top:2px;
+    font:inherit; font-size:13px; color:var(--text);
+    background:var(--surface-2); border:1px solid var(--accent); border-radius:7px;
+    padding:4px 10px; outline:none;
+  }
 
   /* ── 统计玻璃卡 ── */
   .glass{
@@ -251,6 +259,21 @@
   .add-btn:active{ transform:scale(.96); filter:brightness(.98) }
   .shake{ animation:shake .35s ease }
   @keyframes shake{ 20%,60%{ transform:translateX(-5px) } 40%,80%{ transform:translateX(5px) } }
+
+  /* ── 搜索 ── */
+  .search-bar{ display:flex; align-items:center; gap:8px; margin-top:12px;
+    padding:0 16px; height:42px; border-radius:14px;
+    border:1px solid var(--border-strong); background:var(--surface); color:var(--text-2);
+    transition:border-color .18s, box-shadow .18s; }
+  .search-bar:focus-within{ border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft) }
+  .search-ico{ display:flex; color:var(--text-2); flex:none }
+  .search-input{ flex:1; border:none; background:transparent; color:var(--text); font:inherit; font-size:14px; outline:none; min-width:0 }
+  .search-input::placeholder{ color:var(--text-2); opacity:.75 }
+  .search-input::-webkit-search-cancel-button{ display:none }
+  .search-clear{ border:none; background:transparent; color:var(--text-2); font-size:20px; line-height:1;
+    cursor:pointer; padding:0 2px; flex:none }
+  .search-clear:hover{ color:var(--accent) }
+  #searchSection .search-empty{ padding:26px 4px; text-align:center; color:var(--text-2); font-size:14px }
 
   /* ── 分区 ── */
   .section{ margin-top:32px }
@@ -544,6 +567,13 @@
     <button class="add-btn" id="addBtn"><span id="addBtnIco"></span>添加</button>
   </div>
 
+  <div class="search-bar">
+    <span class="search-ico" id="searchIco"></span>
+    <input class="search-input" id="searchInput" type="search" autocomplete="off"
+           placeholder="搜索全部事项（名称 / 备注 / 日期）…">
+    <button class="search-clear" id="searchClear" title="清除" hidden>×</button>
+  </div>
+
   <div class="empty" id="emptyState" hidden>
     <div class="big-ico" id="emptyIco"></div>
     <h3>今天还没有记录</h3>
@@ -564,6 +594,12 @@
       </summary>
       <div id="historyDays"></div>
     </details>
+  </section>
+
+  <section class="section" id="searchSection" hidden>
+    <div class="section-head"><span>搜索结果</span><span id="searchMeta"></span><span class="hline"></span></div>
+    <div class="group-body" id="searchList"></div>
+    <div class="search-empty" id="searchEmpty" hidden>没有匹配的事项，换个关键词试试～</div>
   </section>
 
   <footer class="footer">数据仅保存在此浏览器的本地存储中 · 清理浏览器数据前建议先导出 CSV 备份</footer>
@@ -700,7 +736,8 @@ const ICONS = {
   clockEmpty:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   report:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>',
   backup:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
-  gear:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>'
+  gear:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>',
+  search:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>'
 };
 const icon = (n, s = 16) => ICONS[n].replace('<svg ', `<svg width="${s}" height="${s}" `);
 
@@ -1366,7 +1403,7 @@ function renderRunCell(){
       cell.appendChild(inp);
     } else {
       const rn = el('div', 'rn', r.name);
-      rn.title = '点击修改名称';
+      rn.title = r.note ? ('点击修改名称 · 备注：' + r.note) : '点击修改名称';
       rn.addEventListener('click', () => {
         editingId = r.id;
         editingNoteId = null;
@@ -1402,6 +1439,30 @@ function renderRunCell(){
     fb.addEventListener('click', () => finishTask(r.id));
     acts.appendChild(pb); acts.appendChild(fb);
     cell.appendChild(acts);
+
+    /* 正在专注的任务不在「今日事项」列表里，只渲染在此专注条；原实现专注条没有备注输入框，
+       点「编辑备注」后页面里找不到 .note-input，所以无法编辑。这里补上行内备注输入，
+       交互与卡片一致：回车保存、Esc 取消、失焦保存。 */
+    if (editingNoteId === r.id){
+      cell.classList.add('note-editing');
+      const ninp = el('input', 'note-input');
+      ninp.value = r.note || '';
+      ninp.maxLength = 200;
+      ninp.placeholder = '一句话备注，回车保存，Esc 取消';
+      const commitNote = () => {
+        if (editingNoteId !== r.id) return;
+        const v = ninp.value.trim();
+        editingNoteId = null;
+        if (v !== (r.note || '')){ r.note = v; save(); }
+        renderAll();
+      };
+      ninp.addEventListener('keydown', e => {
+        if (e.key === 'Enter'){ e.preventDefault(); commitNote(); }
+        else if (e.key === 'Escape'){ editingNoteId = null; renderAll(); }
+      });
+      ninp.addEventListener('blur', commitNote);
+      cell.appendChild(ninp);
+    }
   } else {
     const lbl = el('div', 'lbl');
     lbl.appendChild(el('span', 'dot running'));
@@ -1435,6 +1496,55 @@ function historyDates(today, todaySecs){
   const secs = todaySecs || new Map(dayRows(today).map(r => [r.t.id, r.sec]));
   const hist = state.tasks.filter(t => t.date !== today && (secs.get(t.id) || 0) <= 0);
   return [...new Set(hist.map(t => t.date))].sort().reverse();
+}
+
+/* ───────── 全局搜索 ───────── */
+/* 模糊搜索：连续子串命中优先（越靠前分越高），否则按字符顺序的子序列命中（间隔越小分越高）；
+   多关键词以空格分隔、需全部命中(AND)。搜索范围覆盖全部事项（含历史），命中即展示结果并临时隐藏今日/历史分区。 */
+let searchQuery = '';
+function fuzzyScore(q, text){
+  q = q.toLowerCase(); text = text.toLowerCase();
+  const idx = text.indexOf(q);
+  if (idx >= 0) return 1000 - idx;
+  let qi = 0, last = -1, gaps = 0;
+  for (let i = 0; i < text.length && qi < q.length; i++){
+    if (text[i] === q[qi]){ if (last >= 0) gaps += i - last - 1; last = i; qi++; }
+  }
+  return qi === q.length ? Math.max(1, 200 - gaps) : 0;
+}
+function searchableText(t){
+  return [t.name, t.note || '', t.date, fmtDateCN(t.date), STATUS_CN[t.status] || t.status].join(' ');
+}
+function renderSearchResults(q){
+  const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+  const today = todayStr();
+  const matched = [];
+  for (const t of state.tasks){
+    let score = 0;
+    for (const term of terms){
+      const s = fuzzyScore(term, searchableText(t));
+      if (s <= 0){ score = 0; break; }
+      score += s;
+    }
+    if (score > 0) matched.push({ t, score });
+  }
+  matched.sort((a,b) => b.score - a.score || (b.t.date < a.t.date ? -1 : b.t.date > a.t.date ? 1 : 0));
+  const list = $('#searchList');
+  list.innerHTML = '';
+  $('#searchMeta').textContent = matched.length ? matched.length + ' 条' : '';
+  $('#searchEmpty').hidden = matched.length > 0;
+  matched.forEach(({t}) => list.appendChild(buildCard(t, today)));
+  $('#searchSection').hidden = false;
+  $('#activeSection').hidden = true;
+  $('#historySection').hidden = true;
+  $('#emptyState').hidden = true;
+}
+function applySearch(){
+  const v = $('#searchInput').value.trim();
+  searchQuery = v;
+  $('#searchClear').hidden = v.length === 0;
+  if (v) renderSearchResults(v);
+  else { $('#searchSection').hidden = true; renderAll(); }
 }
 function renderHistory(today){
   /* 原逻辑只收 status==='done'，暂停中的跨天遗留项没有任何归宿；
@@ -1591,6 +1701,7 @@ function renderAll(){
   renderNameList();
   updateGreet();
   renderEmpty();
+  if (searchQuery) renderSearchResults(searchQuery);
   playFlip(before);
   tickDynamic();
 }
@@ -1982,11 +2093,22 @@ function updateGreet(){
   const h = new Date().getHours();
   const hello = h < 6 ? '夜深了' : h < 11 ? '早上好' : h < 13 ? '中午好' : h < 18 ? '下午好' : '晚上好';
   $('#greetTitle').textContent = hello + '！';
-  const n = state.tasks.filter(t => t.status !== 'done').length;
-  const yi = YI_LIST[Math.abs(todayStr().split('-').join('') * 7) % YI_LIST.length];
-  $('#greetText').innerHTML = n > 0
-    ? '今天还有 <b>' + n + '</b> 件事等你安排，我先帮你看着~'
-    : '今天的事都安排完啦，好好休息~';
+  // 按归属日拆分「今天待办」与「历史待办」，与今日事项(renderActive)/历史记录(historyDates)口径一致
+  // （Plan B：跨天任务按自然日归属，今天有投入算今天、否则归入历史）
+  const today = todayStr();
+  const todaySecs = new Map(dayRows(today).map(r => [r.t.id, r.sec]));
+  const isToday = t => t.date === today || (todaySecs.get(t.id) || 0) > 0;
+  const isHist = t => t.date !== today && (todaySecs.get(t.id) || 0) <= 0;
+  const todayPending = state.tasks.filter(t => isToday(t) && t.status !== 'done').length;
+  const histPending = state.tasks.filter(t => isHist(t) && t.status !== 'done').length;
+  const yi = YI_LIST[Math.abs(today.split('-').join('') * 7) % YI_LIST.length];
+  if (todayPending === 0 && histPending === 0){
+    $('#greetText').innerHTML = '今天和历史的事都安排完啦，好好休息~';
+  } else {
+    $('#greetText').innerHTML = '今天还有 <b>' + todayPending + '</b> 件待办'
+      + (histPending > 0 ? '，历史还有 <b>' + histPending + '</b> 件待办' : '')
+      + '，我先帮你看着~';
+  }
   $('#yiChip').textContent = '今日宜 · ' + yi;
 }
 
@@ -2015,6 +2137,10 @@ $('#emptyIco').innerHTML = petSVG('cheer', 88);
 document.querySelectorAll('[data-chev]').forEach(n => n.innerHTML = icon('chevron', 14));
 $('#addBtn').addEventListener('click', addFromInput);
 $('#taskInput').addEventListener('keydown', e => { if (e.key === 'Enter') addFromInput(); });
+$('#searchInput').addEventListener('input', applySearch);
+$('#searchInput').addEventListener('keydown', e => { if (e.key === 'Escape'){ $('#searchInput').value = ''; applySearch(); } });
+$('#searchClear').addEventListener('click', () => { $('#searchInput').value = ''; applySearch(); $('#searchInput').focus(); });
+$('#searchIco').innerHTML = icon('search', 15);
 
 initTheme();
 renderAll();
